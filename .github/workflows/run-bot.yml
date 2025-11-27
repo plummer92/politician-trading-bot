@@ -23,6 +23,10 @@ jobs:
         pip install --upgrade pip
         pip install -r requirements.txt --no-cache-dir
 
+    - name: Write Google credentials JSON
+      run: |
+        echo '${{ toJSON(secrets.google_credentials) }}' > credentials.json
+
     - name: Run bot
       env:
         QUIVER_KEY: ${{ secrets.QUIVER_KEY }}
@@ -36,7 +40,4 @@ jobs:
         DATABASE_URL: ${{ secrets.DATABASE_URL }}
 
       run: |
-        # Write Google credentials to file
-        echo "${{ secrets.GOOGLE_SERVICE_JSON }}" > credentials.json
-
         python bot.py
