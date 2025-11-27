@@ -6,9 +6,12 @@ import pandas as pd
 import numpy as np
 import datetime as dt
 import gspread
+import asyncio
+
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from oauth2client.service_account import ServiceAccountCredentials
+
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import MarketOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
@@ -27,7 +30,12 @@ EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")
 EMAIL_RECIPIENT = os.getenv("EMAIL_RECIPIENT")
 
 # ====================================================
-# 2. Google Sheets Authentication
+# 2. Import Neon async logging
+# ====================================================
+import db  # <-- this connects to Neon
+
+# ====================================================
+# 3. Google Sheets Authentication
 # ====================================================
 creds = ServiceAccountCredentials.from_json_keyfile_name(
     GOOGLE_APPLICATION_CREDENTIALS,
@@ -36,7 +44,7 @@ creds = ServiceAccountCredentials.from_json_keyfile_name(
 gc = gspread.authorize(creds)
 
 # ====================================================
-# 3. Trailing Stop Setup
+# 4. Trailing Stop Setup
 # ====================================================
 TRAILING_FILE = "trailing_sl.json"
 TRAIL_PERCENT = 0.08          # 8% trailing stop
@@ -58,7 +66,7 @@ def save_trailing_data(data):
         json.dump(data, f, indent=4)
 
 # ====================================================
-# 4. Fetch Quiver Congress Trading
+# 5. Fetch Quiver Congress Trading
 # ====================================================
 def fetch_congress_trades():
     url = "https://api.quiverquant.com/beta/bulk/congresstrading"
@@ -81,7 +89,7 @@ def fetch_congress_trades():
     return df
 
 # ====================================================
-# 5. Score Trades
+# 6. Score Trades
 # ====================================================
 def score_trades(df):
     df = df.copy()
@@ -111,7 +119,7 @@ def score_trades(df):
     return df.sort_values(by="score", ascending=False)
 
 # ====================================================
-# 6. Log Buys to Google Sheets
+# 7. Log Buys to Google Sheets
 # ====================================================
 def log_buys_to_sheet(df):
     try:
@@ -134,13 +142,12 @@ def log_buys_to_sheet(df):
     print("Logged buys to sheet")
 
 # ====================================================
-# 7. Alpaca Buy Engine
+# 8. Alpaca Buy Engine
 # ====================================================
 trading_client = TradingClient(ALPACA_KEY, ALPACA_SECRET, paper=True)
 
 
 def get_price(symbol):
-    """Reliable quote getter for GitHub Actions."""
     try:
         q = trading_client.get_latest_quote(symbol)
         return q.ask_price or q.bid_price
@@ -188,33 +195,6 @@ def execute_buys(df):
             print(f"Buy error for {sym}:", e)
 
     return bought
-
-# ====================================================
-# 8. Log Sells to Sheet
-# ====================================================
-def log_sale_to_sheet(s):
-    sh = gc.open(GOOGLE_SHEET_NAME)
-
-    try:
-        ws = sh.worksheet("Sales_Log")
-    except:
-        ws = sh.add_worksheet("Sales_Log", rows=1000, cols=20)
-        ws.append_row([
-            "Timestamp", "Ticker", "Qty", "SellPrice", "CostBasis",
-            "HighestPrice", "DropPct", "PLPct", "Reason"
-        ])
-
-    ws.append_row([
-        dt.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
-        s["symbol"],
-        s["qty"],
-        s["price"],
-        s["cost"],
-        s["highest"],
-        f"{s['drop_pct']*100:.2f}%",
-        f"{s['pl_pct']*100:.2f}%",
-        "Trailing Stop"
-    ])
 
 # ====================================================
 # 9. Trailing Stop Engine
@@ -274,7 +254,6 @@ def trailing_stop_and_sell():
                 )
             )
             print(f"Sold {row['symbol']} — drop {row['drop_pct']*100:.2f}%")
-            log_sale_to_sheet(row)
             executed.append(row)
 
         except Exception as e:
@@ -283,7 +262,7 @@ def trailing_stop_and_sell():
     return executed
 
 # ====================================================
-# 10. Email Report
+# 🔔 Email Report
 # ====================================================
 def send_email_report(buys, sells):
     try:
@@ -328,12 +307,28 @@ def run_bot():
     df = fetch_congress_trades()
     df_scored = score_trades(df)
 
+    # GOOGLE SHEETS (keep existing)
     log_buys_to_sheet(df_scored)
 
+    # EXECUTE TRADES
     buys = execute_buys(df_scored)
     sells = trailing_stop_and_sell()
 
+    # EMAIL REPORT
     send_email_report(buys, sells)
+
+    # =======================================
+    # 🔥 Fire-and-forget Neon logging
+    # =======================================
+    async def async_logging():
+        await db.log_run_event("start")
+        await db.log_quiver_raw(df)
+        await db.log_scored_trades(df_scored)
+        await db.log_buys(buys)
+        await db.log_sells(sells)
+        await db.log_run_event("end")
+
+    asyncio.run(async_logging())
 
     print("Bot complete.")
 
