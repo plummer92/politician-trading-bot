@@ -47,18 +47,24 @@ def fetch_congress_trades():
     r.raise_for_status()
 
     df = pd.DataFrame(r.json())
+
     print("Columns returned:", df.columns.tolist())
 
+    # The correct date field in YOUR dataset is "Traded"
+    if "Traded" not in df.columns:
+        raise KeyError("Expected column 'Traded' not found in Quiver data")
 
-    # Rename Quiver 'Date' → 'TransactionDate'
-    df["TransactionDate"] = pd.to_datetime(df["Date"], errors="coerce")
+    df["TransactionDate"] = pd.to_datetime(df["Traded"], errors="coerce")
+
+    # Drop invalid dates
     df = df.dropna(subset=["TransactionDate"])
 
-    # Only keep last 30 days
-    cutoff = dt.datetime.now() - dt.timedelta(days=30)
+    # Filter trades from the last 30 days
+    cutoff = dt.datetime.utcnow() - dt.timedelta(days=30)
     df = df[df["TransactionDate"] >= cutoff]
 
     return df
+
 
 
 
