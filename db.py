@@ -1,279 +1,218 @@
 import os
-import asyncio
 import json
-from typing import Optional, List, Dict, Any
+import traceback
+import asyncio
 from datetime import datetime
-
-from sqlalchemy.ext.asyncio import (
-    AsyncEngine,
-    create_async_engine,
-    AsyncSession,
-)
-from sqlalchemy.orm import sessionmaker
 from sqlalchemy import text
-import backoff
+from sqlalchemy.ext.asyncio import create_async_engine
 
+# Load Streamlit-style secrets or os env
+DATABASE_URL = os.getenv("DATABASE_URL") or os.getenv("database_url")
 
-# ============================================================
-# DATABASE URL (from Streamlit secrets or real env var)
-# ============================================================
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL not found in environment!")
 
-def load_db_url():
-    # Streamlit secrets if available
-    try:
-        import streamlit as st
-        return st.secrets["database"]["url"]
-    except:
-        return os.getenv("DATABASE_URL")
-
-DATABASE_URL = load_db_url()
-
-# Convert to asyncpg
+# Convert postgres:// → postgresql+asyncpg://
 ASYNC_DB_URL = DATABASE_URL.replace("postgresql://", "postgresql+asyncpg://")
 
-
-# ============================================================
-# CREATE ENGINE + SESSION FACTORY
-# ============================================================
-
-engine: AsyncEngine = create_async_engine(
+engine = create_async_engine(
     ASYNC_DB_URL,
     echo=False,
-    future=True,
-    pool_size=20,
-    max_overflow=30,
     pool_pre_ping=True,
+    pool_recycle=1800,
 )
 
-AsyncSessionLocal = sessionmaker(
-    engine,
-    expire_on_commit=False,
-    class_=AsyncSession,
-)
+# ============================================================
+# REUSABLE EXECUTOR
+# ============================================================
+async def execute(query, params=None):
+    try:
+        async with engine.begin() as conn:
+            await conn.execute(text(query), params or {})
+    except Exception as e:
+        print("DB Error:", e)
+        print(query)
+        print(params)
+        print(traceback.format_exc())
+        # Never raise — logging only
+        return False
+    return True
 
 
 # ============================================================
-# RETRY HANDLER (auto reconnect on Neon network blips)
+# RAW QUIVER DATA LOGGING
 # ============================================================
-def backoff_hdlr(details):
-    print(f"[DB RETRY] Error: {details['exception']} — retrying...")
+async def log_quiver_raw(df):
+    if df.empty:
+        return
 
+    query = """
+        INSERT INTO quiver_raw (
+            transaction_date, ticker, company, transaction, trade_size_usd,
+            name, party, district, chamber, excess_return, raw_json
+        )
+        VALUES (
+            :transaction_date, :ticker, :company, :transaction, :trade_size_usd,
+            :name, :party, :district, :chamber, :excess_return, :raw_json
+        );
+    """
 
-retry_db = backoff.on_exception(
-    backoff.expo,
-    Exception,
-    max_tries=5,
-    on_backoff=backoff_hdlr,
-)
-
-
-# ============================================================
-# CORE HELPER
-# ============================================================
-@retry_db
-async def exec(query: str, params: Optional[dict] = None):
-    """Run a query and return result rows as list of dicts."""
-    async with AsyncSessionLocal() as session:
-        try:
-            result = await session.execute(text(query), params or {})
-            await session.commit()
-
-            # Convert to list of dicts
-            if result.returns_rows:
-                rows = [dict(row) for row in result.mappings().all()]
-                return rows
-            return None
-
-        except Exception as e:
-            await session.rollback()
-            print("❌ DB ERROR:", e)
-            raise
+    for _, row in df.iterrows():
+        params = {
+            "transaction_date": row.get("TransactionDate"),
+            "ticker": row.get("Ticker"),
+            "company": row.get("Company"),
+            "transaction": row.get("Transaction"),
+            "trade_size_usd": row.get("Trade_Size_USD"),
+            "name": row.get("Name"),
+            "party": row.get("Party"),
+            "district": row.get("District"),
+            "chamber": row.get("Chamber"),
+            "excess_return": row.get("excess_return"),
+            "raw_json": json.dumps(row.to_dict())
+        }
+        await execute(query, params)
 
 
 # ============================================================
-# INSERTORS
+# SCORED TRADES LOGGING
 # ============================================================
+async def log_scored_trades(df):
+    if df.empty:
+        return
 
-async def log_politician_trade(
-    politician: str,
-    ticker: str,
-    transaction_type: str,
-    amount_min: Optional[float],
-    amount_max: Optional[float],
-    date: datetime,
-):
-    return await exec(
-        """
-        INSERT INTO politician_trades
-        (politician, ticker, transaction_type, amount_min, amount_max, transaction_date)
-        VALUES (:p, :t, :ty, :min, :max, :d)
-        """,
+    query = """
+        INSERT INTO scored_trades (
+            transaction_date, ticker, company, transaction, trade_size_usd,
+            name, party, district, chamber, excess_return, score, raw_json
+        )
+        VALUES (
+            :transaction_date, :ticker, :company, :transaction, :trade_size_usd,
+            :name, :party, :district, :chamber, :excess_return, :score, :raw_json
+        );
+    """
+
+    for _, row in df.iterrows():
+        params = {
+            "transaction_date": row.get("TransactionDate"),
+            "ticker": row.get("Ticker"),
+            "company": row.get("Company"),
+            "transaction": row.get("Transaction"),
+            "trade_size_usd": row.get("Trade_Size_USD"),
+            "name": row.get("Name"),
+            "party": row.get("Party"),
+            "district": row.get("District"),
+            "chamber": row.get("Chamber"),
+            "excess_return": row.get("excess_return"),
+            "score": row.get("score"),
+            "raw_json": json.dumps(row.to_dict())
+        }
+        await execute(query, params)
+
+
+# ============================================================
+# BUY LOGGING
+# ============================================================
+async def log_buys(buys):
+    if not buys:
+        return
+
+    query = """
+        INSERT INTO buys (ticker, qty, price, total_cost, raw_json)
+        VALUES (:ticker, :qty, :price, :total_cost, :raw_json);
+    """
+
+    for sym, qty, price in buys:
+        params = {
+            "ticker": sym,
+            "qty": qty,
+            "price": price,
+            "total_cost": qty * price,
+            "raw_json": json.dumps({"symbol": sym, "qty": qty, "price": price})
+        }
+        await execute(query, params)
+
+
+# ============================================================
+# SELL LOGGING
+# ============================================================
+async def log_sells(sells):
+    if not sells:
+        return
+
+    query = """
+        INSERT INTO sells (
+            ticker, qty, price, cost_basis, highest_price,
+            drop_pct, pl_pct, reason, raw_json
+        )
+        VALUES (
+            :ticker, :qty, :price, :cost_basis, :highest_price,
+            :drop_pct, :pl_pct, :reason, :raw_json
+        );
+    """
+
+    for s in sells:
+        params = {
+            "ticker": s["symbol"],
+            "qty": s["qty"],
+            "price": s["price"],
+            "cost_basis": s["cost"],
+            "highest_price": s["highest"],
+            "drop_pct": s["drop_pct"],
+            "pl_pct": s["pl_pct"],
+            "reason": "Trailing Stop",
+            "raw_json": json.dumps(s)
+        }
+        await execute(query, params)
+
+
+# ============================================================
+# POSITION SNAPSHOT
+# ============================================================
+async def log_positions(positions):
+    if not positions:
+        return
+
+    query = """
+        INSERT INTO positions (
+            ticker, qty, avg_cost, current_price,
+            market_value, unrealized_pl
+        )
+        VALUES (
+            :ticker, :qty, :avg_cost, :current_price,
+            :market_value, :unrealized_pl
+        );
+    """
+
+    for p in positions:
+        params = {
+            "ticker": p.symbol,
+            "qty": float(p.qty),
+            "avg_cost": float(p.avg_entry_price),
+            "current_price": float(p.current_price),
+            "market_value": float(p.market_value),
+            "unrealized_pl": float(p.unrealized_pl)
+        }
+        await execute(query, params)
+
+
+# ============================================================
+# RUN START/END
+# ============================================================
+async def log_run_event(event):
+    await execute("INSERT INTO runs (event) VALUES (:event)", {"event": event})
+
+
+# ============================================================
+# ERROR LOGGING
+# ============================================================
+async def log_error(step, error):
+    await execute(
+        """INSERT INTO errors (step, message, traceback)
+           VALUES (:step, :message, :traceback)""",
         {
-            "p": politician,
-            "t": ticker,
-            "ty": transaction_type,
-            "min": amount_min,
-            "max": amount_max,
-            "d": date,
-        },
+            "step": step,
+            "message": str(error),
+            "traceback": traceback.format_exc(),
+        }
     )
-
-
-async def log_buy_score(
-    ticker: str,
-    score: float,
-    reason: str,
-    politician_count: int,
-    last_trade_date: Optional[datetime],
-):
-    return await exec(
-        """
-        INSERT INTO buy_scores (ticker, score, reason, politician_count, last_trade_date)
-        VALUES (:t, :s, :r, :c, :d)
-        """,
-        {
-            "t": ticker,
-            "s": score,
-            "r": reason,
-            "c": politician_count,
-            "d": last_trade_date,
-        },
-    )
-
-
-async def log_bot_trade(
-    ticker: str,
-    side: str,
-    qty: float,
-    price: float,
-    order_id: str,
-    portfolio_value: Optional[float],
-    score: Optional[float],
-    signal_count: Optional[int],
-):
-    return await exec(
-        """
-        INSERT INTO bot_trades
-        (ticker, side, qty, price, order_id, portfolio_value, score, politician_signal)
-        VALUES (:t, :s, :q, :p, :oid, :pv, :sc, :sig)
-        ON CONFLICT (order_id) DO NOTHING;
-        """,
-        {
-            "t": ticker,
-            "s": side,
-            "q": qty,
-            "p": price,
-            "oid": order_id,
-            "pv": portfolio_value,
-            "sc": score,
-            "sig": signal_count,
-        },
-    )
-
-
-async def log_portfolio_value(value: float):
-    return await exec(
-        """
-        INSERT INTO portfolio_history (total_value)
-        VALUES (:v)
-        """,
-        {"v": value},
-    )
-
-
-async def log_position(
-    ticker: str,
-    qty: float,
-    avg: float,
-    price: Optional[float],
-):
-    return await exec(
-        """
-        INSERT INTO positions (ticker, qty, avg_entry_price, current_price)
-        VALUES (:t, :q, :a, :p)
-        """,
-        {"t": ticker, "q": qty, "a": avg, "p": price},
-    )
-
-
-async def log_bot_event(level: str, message: str, context: Optional[dict] = None):
-    return await exec(
-        """
-        INSERT INTO bot_logs (level, message, context)
-        VALUES (:l, :m, :c)
-        """,
-        {"l": level, "m": message, "c": json.dumps(context or {})},
-    )
-
-
-async def log_bot_run_start() -> int:
-    rows = await exec(
-        """
-        INSERT INTO bot_runs (run_started)
-        VALUES (NOW())
-        RETURNING id;
-        """
-    )
-    return rows[0]["id"]
-
-
-async def log_bot_run_end(run_id: int, trades: int, errors: int):
-    return await exec(
-        """
-        UPDATE bot_runs
-        SET run_finished = NOW(),
-            trades_made = :t,
-            errors = :e
-        WHERE id = :id;
-        """,
-        {"id": run_id, "t": trades, "e": errors},
-    )
-
-
-# ============================================================
-# FETCH HELPERS
-# ============================================================
-
-async def get_latest_scores(limit=50):
-    return await exec(
-        """
-        SELECT * FROM buy_scores
-        ORDER BY created_at DESC
-        LIMIT :n
-        """,
-        {"n": limit},
-    )
-
-
-async def get_recent_trades(limit=50):
-    return await exec(
-        """
-        SELECT * FROM bot_trades
-        ORDER BY timestamp DESC
-        LIMIT :n
-        """,
-        {"n": limit},
-    )
-
-
-async def get_positions_for_ticker(ticker: str):
-    return await exec(
-        """
-        SELECT * FROM positions
-        WHERE ticker = :t
-        ORDER BY timestamp DESC
-        """,
-        {"t": ticker},
-    )
-
-
-# ============================================================
-# TEST FUNCTION
-# ============================================================
-if __name__ == "__main__":
-    async def test():
-        print("▶ Testing DB connection...")
-        rows = await exec("SELECT NOW() AS server_time;")
-        print("Success:", rows)
-
-    asyncio.run(test())
