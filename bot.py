@@ -123,7 +123,8 @@ trading_client = TradingClient(ALPACA_KEY, ALPACA_SECRET, paper=True)
 def execute_trades(df):
     print("Executing Alpaca paper trades...")
 
-    df_trade = df[df["score"] >= 5]   # ⭐ NEW RULE
+    df_trade = df[df["score"] >= 6]   # ⭐ NEW THRESHOLD
+   # ⭐ NEW RULE
 
     if df_trade.empty:
         print("No trades above score threshold (>=5).")
@@ -171,6 +172,110 @@ def execute_trades(df):
             print(f"Trade error for {symbol}: {e}")
 
     print("Trade execution completed.")
+# ====================================================
+# Sell Logic (Stop-Loss & Take-Profit)
+# ====================================================
+def sell_logic(stop_loss=-0.05, take_profit=0.10):
+    print("Checking positions for sell conditions...")
+
+    try:
+        positions = trading_client.get_all_positions()
+    except Exception as e:
+        print("Failed to fetch Alpaca positions:", e)
+        return
+
+    if not positions:
+        print("No positions to evaluate.")
+        return
+
+    sells = []  # track sales for logging
+
+    for pos in positions:
+        try:
+            symbol = pos.symbol
+            qty = float(pos.qty)
+            cost = float(pos.avg_entry_price)
+
+            latest = trading_client.get_latest_trade(symbol)
+            current_price = latest.price
+
+            if not current_price or current_price <= 0:
+                print(f"Skipping {symbol}: unable to read price.")
+                continue
+
+            pl_pct = (current_price - cost) / cost
+
+            print(f"{symbol}: cost={cost}, price={current_price}, P/L={pl_pct:.2%}")
+
+            should_sell = False
+            reason = ""
+
+            if pl_pct <= stop_loss:
+                should_sell = True
+                reason = f"STOP-LOSS triggered ({pl_pct:.2%})"
+            elif pl_pct >= take_profit:
+                should_sell = True
+                reason = f"TAKE-PROFIT triggered ({pl_pct:.2%})"
+
+            if should_sell:
+                order = MarketOrderRequest(
+                    symbol=symbol,
+                    qty=int(qty),
+                    side=OrderSide.SELL,
+                    time_in_force=TimeInForce.DAY
+                )
+
+                try:
+                    trading_client.submit_order(order)
+                    print(f"Sold {int(qty)} shares of {symbol} — {reason}")
+
+                    sells.append({
+                        "Ticker": symbol,
+                        "Quantity": int(qty),
+                        "SellReason": reason,
+                        "SellPrice": current_price,
+                        "Timestamp": dt.datetime.utcnow().isoformat()
+                    })
+
+                except Exception as e:
+                    print(f"Sell error for {symbol}: {e}")
+
+        except Exception as e:
+            print(f"Error evaluating {pos.symbol}: {e}")
+
+    if sells:
+        log_sales_to_sheet(sells)
+
+# ====================================================
+# Log Sells to Google Sheets
+# ====================================================
+def log_sales_to_sheet(sells):
+    print("Logging sales to Google Sheets...")
+
+    worksheet = gc.open(GOOGLE_SHEET_NAME).sheet1
+
+    # Ensure SELL LOG header exists
+    header = ["Timestamp", "Ticker", "Quantity", "SellPrice", "SellReason"]
+    existing_header = worksheet.row_values(1)
+
+    if existing_header != header:
+        worksheet.clear()
+        worksheet.append_row(header)
+
+    for s in sells:
+        row = [
+            s["Timestamp"],
+            s["Ticker"],
+            str(s["Quantity"]),
+            str(s["SellPrice"]),
+            s["SellReason"],
+        ]
+        worksheet.append_row(row)
+
+    print("Sales logged.")
+
+
+
 
 # ====================================================
 # 7. Main Bot Flow
@@ -187,6 +292,10 @@ def run_bot():
 
     print("Executing trades...")
     execute_trades(df_scored)
+
+    print("Evaluating sell conditions...")
+    sell_logic(stop_loss=-0.05, take_profit=0.10)
+
 
     print("Bot run complete.")
 
