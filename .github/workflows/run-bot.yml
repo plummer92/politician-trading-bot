@@ -1,41 +1,42 @@
-name: Daily Politician Trading Bot
+name: Run Politician Trading Bot
 
 on:
+  workflow_dispatch:
   schedule:
-    - cron: "0 14 * * *"   # Runs daily at 8:00 AM CST (14:00 UTC)
-  workflow_dispatch:       # Allows manual run
-  push:
-    branches:
-      - main
+    - cron: "0 14 * * *"   # runs daily at 8 AM CST (14 UTC)
 
 jobs:
   run-bot:
     runs-on: ubuntu-latest
-    
+
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v3
+    - name: Checkout repository
+      uses: actions/checkout@v3
 
-      - name: Set up Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: "3.10"
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: "3.10"
 
-      - name: Install dependencies
-        run: |
-          pip install requests pandas numpy gspread oauth2client alpaca-py
+    - name: Install dependencies
+      run: |
+        pip install --upgrade pip
+        pip install -r requirements.txt --no-cache-dir
 
-      - name: Create Google Service JSON
-        env:
-          GOOGLE_SERVICE_JSON: ${{ secrets.GOOGLE_SERVICE_JSON }}
-        run: |
-          echo "$GOOGLE_SERVICE_JSON" > service_account.json
+    - name: Run bot
+      env:
+        QUIVER_KEY: ${{ secrets.QUIVER_KEY }}
+        ALPACA_KEY: ${{ secrets.ALPACA_KEY }}
+        ALPACA_SECRET: ${{ secrets.ALPACA_SECRET }}
+        GOOGLE_SHEET_NAME: ${{ secrets.GOOGLE_SHEET_NAME }}
+        GOOGLE_APPLICATION_CREDENTIALS: credentials.json
+        EMAIL_SENDER: ${{ secrets.EMAIL_SENDER }}
+        EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+        EMAIL_RECIPIENT: ${{ secrets.EMAIL_RECIPIENT }}
+        DATABASE_URL: ${{ secrets.DATABASE_URL }}
 
-      - name: Run trading bot
-        env:
-          QUIVER_KEY: ${{ secrets.QUIVER_KEY }}
-          ALPACA_KEY: ${{ secrets.ALPACA_KEY }}
-          ALPACA_SECRET: ${{ secrets.ALPACA_SECRET }}
-          GOOGLE_SHEET_NAME: ${{ secrets.GOOGLE_SHEET_NAME }}
-          GOOGLE_APPLICATION_CREDENTIALS: "service_account.json"
-        run: python bot.py
+      run: |
+        # Write Google credentials to file
+        echo "${{ secrets.GOOGLE_SERVICE_JSON }}" > credentials.json
+
+        python bot.py
