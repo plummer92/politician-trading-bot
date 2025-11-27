@@ -1,10 +1,13 @@
 import os
 import json
+import smtplib
 import requests
 import pandas as pd
 import numpy as np
 import datetime as dt
 import gspread
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 from oauth2client.service_account import ServiceAccountCredentials
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import MarketOrderRequest
@@ -19,8 +22,9 @@ ALPACA_SECRET = os.getenv("ALPACA_SECRET")
 GOOGLE_SHEET_NAME = os.getenv("GOOGLE_SHEET_NAME")
 GOOGLE_APPLICATION_CREDENTIALS = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
 
-if not QUIVER_KEY:
-    raise ValueError("QUIVER_KEY secret missing")
+EMAIL_SENDER = os.getenv("EMAIL_SENDER")
+EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")
+EMAIL_RECIPIENT = os.getenv("EMAIL_RECIPIENT")
 
 # ====================================================
 # 2. Google Sheets Authentication
@@ -35,8 +39,9 @@ gc = gspread.authorize(creds)
 # 3. Trailing Stop Setup
 # ====================================================
 TRAILING_FILE = "trailing_sl.json"
-TRAIL_PERCENT = 0.08         # 8% trailing stop
-TOP_LOSERS_TO_SELL = 3       # Sell 3 worst losers
+TRAIL_PERCENT = 0.08          # 8% trailing stop
+TOP_LOSERS_TO_SELL = 3        # sell 3 worst losers per run
+
 
 def load_trailing_data():
     if not os.path.exists(TRAILING_FILE):
@@ -47,25 +52,25 @@ def load_trailing_data():
     except:
         return {}
 
+
 def save_trailing_data(data):
     with open(TRAILING_FILE, "w") as f:
         json.dump(data, f, indent=4)
 
 # ====================================================
-# 4. Fetch Quiver Data
+# 4. Fetch Quiver Congress Trading
 # ====================================================
 def fetch_congress_trades():
     url = "https://api.quiverquant.com/beta/bulk/congresstrading"
-    headers = {"accept": "application/json", "Authorization": f"Token {QUIVER_KEY}"}
+    headers = {"Authorization": f"Token {QUIVER_KEY}"}
 
     r = requests.get(url, headers=headers)
     r.raise_for_status()
 
     df = pd.DataFrame(r.json())
-    print("Columns returned:", df.columns.tolist())
 
     if "Traded" not in df.columns:
-        raise KeyError("Expected 'Traded' column missing.")
+        raise RuntimeError("Quiver data missing 'Traded' column")
 
     df["TransactionDate"] = pd.to_datetime(df["Traded"], errors="coerce")
     df = df.dropna(subset=["TransactionDate"])
@@ -82,85 +87,87 @@ def score_trades(df):
     df = df.copy()
     df["score"] = 0
 
-    # trade size
+    # Trade size
     if "Trade_Size_USD" in df.columns:
         size = pd.to_numeric(df["Trade_Size_USD"], errors="coerce").fillna(0)
         df["score"] += np.where(size >= 100000, 3,
                         np.where(size >= 25000, 2, 1))
 
-    # buy stronger than sell
+    # Buy > Sell
     df["score"] += df["Transaction"].apply(
-        lambda x: 2 if str(x).upper() == "BUY"
-        else (-2 if str(x).upper() == "SELL" else 0)
+        lambda t: 2 if str(t).upper() == "BUY"
+        else (-2 if str(t).upper() == "SELL" else 0)
     )
 
-    # excess return
+    # Excess return
     if "excess_return" in df.columns:
         er = pd.to_numeric(df["excess_return"], errors="coerce").fillna(0)
         df["score"] += np.where(er > 0.05, 2,
                          np.where(er > 0, 1, 0))
 
-    # activity bonus
+    # Politician bonus
     df["score"] += 1
 
     return df.sort_values(by="score", ascending=False)
 
 # ====================================================
-# 6. Log Buys to Sheet
+# 6. Log Buys to Google Sheets
 # ====================================================
-def log_to_sheet(df):
-    print("Logging buys...")
+def log_buys_to_sheet(df):
+    try:
+        sh = gc.open(GOOGLE_SHEET_NAME)
+        ws = sh.sheet1
+    except Exception as e:
+        print("Google sheet error:", e)
+        return
 
     cols = [
         "TransactionDate","Ticker","Company","Transaction","Trade_Size_USD",
         "Name","Party","District","Chamber","excess_return","score"
     ]
     cols = [c for c in cols if c in df.columns]
-    rows = df[cols].astype(str).values.tolist()
-
-    sh = gc.open(GOOGLE_SHEET_NAME)
-    ws = sh.sheet1
 
     if ws.acell("A1").value in (None, ""):
         ws.append_row(cols)
 
-    ws.append_rows(rows)
-    print("Buy logging complete.")
+    ws.append_rows(df[cols].astype(str).values.tolist())
+    print("Logged buys to sheet")
 
 # ====================================================
 # 7. Alpaca Buy Engine
 # ====================================================
 trading_client = TradingClient(ALPACA_KEY, ALPACA_SECRET, paper=True)
 
+
 def get_price(symbol):
-    """Safe Alpaca quote fetch that works in GitHub Actions."""
+    """Reliable quote getter for GitHub Actions."""
     try:
-        quote = trading_client.get_latest_quote(symbol)
-        return quote.ask_price or quote.bid_price
+        q = trading_client.get_latest_quote(symbol)
+        return q.ask_price or q.bid_price
     except:
         return None
 
-def execute_trades(df):
-    print("Executing buys...")
 
-    df_trade = df[df["score"] >= 6]  # threshold = 6
+def execute_buys(df):
+    df_trade = df[df["score"] >= 6]  # BUY THRESHOLD = 6
 
     if df_trade.empty:
-        print("No trades >= 6.")
-        return
+        print("No trades >= 6")
+        return []
 
-    existing_positions = {pos.symbol for pos in trading_client.get_all_positions()}
+    existing = {p.symbol for p in trading_client.get_all_positions()}
+    bought = []
+
     BUDGET = 50
 
     for _, row in df_trade.iterrows():
-        symbol = row["Ticker"]
+        sym = row["Ticker"]
 
-        if not symbol or symbol in existing_positions:
+        if not sym or sym in existing:
             continue
 
-        price = get_price(symbol)
+        price = get_price(sym)
         if not price or price <= 0:
-            print(f"Skipping {symbol}: bad price")
             continue
 
         qty = max(1, int(BUDGET // price))
@@ -168,93 +175,95 @@ def execute_trades(df):
         try:
             trading_client.submit_order(
                 MarketOrderRequest(
-                    symbol=symbol,
+                    symbol=sym,
                     qty=qty,
                     side=OrderSide.BUY,
                     time_in_force=TimeInForce.DAY
                 )
             )
-            print(f"Bought {qty} {symbol}")
+            print(f"Bought {qty} {sym}")
+            bought.append((sym, qty, price))
 
         except Exception as e:
-            print(f"Buy error for {symbol}: {e}")
+            print(f"Buy error for {sym}:", e)
+
+    return bought
 
 # ====================================================
-# 8. Log Sales
+# 8. Log Sells to Sheet
 # ====================================================
-def log_sale_to_sheet(row):
+def log_sale_to_sheet(s):
     sh = gc.open(GOOGLE_SHEET_NAME)
 
     try:
         ws = sh.worksheet("Sales_Log")
     except:
-        ws = sh.add_worksheet("Sales_Log", rows=1000, cols=10)
-        ws.append_row(["Timestamp","Ticker","Qty","SellPrice","CostBasis","HighestPrice","DropPct","PLPct","Reason"])
+        ws = sh.add_worksheet("Sales_Log", rows=1000, cols=20)
+        ws.append_row([
+            "Timestamp", "Ticker", "Qty", "SellPrice", "CostBasis",
+            "HighestPrice", "DropPct", "PLPct", "Reason"
+        ])
 
     ws.append_row([
         dt.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
-        row["symbol"],
-        row["qty"],
-        row["current"],
-        row["cost"],
-        row["highest"],
-        f"{row['drop_pct']*100:.2f}%",
-        f"{row['pl_pct']*100:.2f}%",
+        s["symbol"],
+        s["qty"],
+        s["price"],
+        s["cost"],
+        s["highest"],
+        f"{s['drop_pct']*100:.2f}%",
+        f"{s['pl_pct']*100:.2f}%",
         "Trailing Stop"
     ])
 
 # ====================================================
-# 9. Trailing Stop Engine (Top 3 losers)
+# 9. Trailing Stop Engine
 # ====================================================
 def trailing_stop_and_sell():
-    print("\n=== Trailing Stop Evaluation ===")
-
     trailing = load_trailing_data()
     positions = trading_client.get_all_positions()
 
     if not positions:
-        print("No open positions.")
-        return
+        print("No positions to evaluate")
+        return []
 
-    eval_rows = []
+    evaluations = []
 
     for pos in positions:
-        symbol = pos.symbol
+        sym = pos.symbol
         qty = float(pos.qty)
         cost = float(pos.avg_entry_price)
         current = float(pos.current_price)
 
-        highest = trailing.get(symbol, {}).get("highest", current)
+        highest = trailing.get(sym, {}).get("highest", current)
         if current > highest:
             highest = current
 
-        trailing[symbol] = {"highest": highest}
+        trailing[sym] = {"highest": highest}
 
         drop_pct = (highest - current) / highest
         pl_pct = (current - cost) / cost if cost > 0 else 0
 
-        eval_rows.append({
-            "symbol": symbol,
+        evaluations.append({
+            "symbol": sym,
             "qty": qty,
-            "current": current,
+            "price": current,
             "cost": cost,
             "highest": highest,
             "drop_pct": drop_pct,
-            "pl_pct": pl_pct
+            "pl_pct": pl_pct,
         })
 
     save_trailing_data(trailing)
 
-    violators = [r for r in eval_rows if r["drop_pct"] >= TRAIL_PERCENT]
+    violators = [e for e in evaluations if e["drop_pct"] >= TRAIL_PERCENT]
+    violators.sort(key=lambda x: x["pl_pct"])
 
-    if not violators:
-        print("No trailing stops triggered.")
-        return
+    sells = violators[:TOP_LOSERS_TO_SELL]
 
-    violators_sorted = sorted(violators, key=lambda x: x["pl_pct"])
-    to_sell = violators_sorted[:TOP_LOSERS_TO_SELL]
+    executed = []
 
-    for row in to_sell:
+    for row in sells:
         try:
             trading_client.submit_order(
                 MarketOrderRequest(
@@ -264,35 +273,70 @@ def trailing_stop_and_sell():
                     time_in_force=TimeInForce.DAY
                 )
             )
-            print(f"🔻 SOLD {row['symbol']} — drop {row['drop_pct']*100:.2f}%")
+            print(f"Sold {row['symbol']} — drop {row['drop_pct']*100:.2f}%")
             log_sale_to_sheet(row)
+            executed.append(row)
 
         except Exception as e:
-            print(f"Sell error for {row['symbol']}: {e}")
+            print(f"Sell error for {row['symbol']}:", e)
+
+    return executed
 
 # ====================================================
-# 10. Main Bot Flow
+# 10. Email Report
+# ====================================================
+def send_email_report(buys, sells):
+    try:
+        msg = MIMEMultipart("alternative")
+        msg["Subject"] = "📈 Daily Politician Trading Bot Report"
+        msg["From"] = EMAIL_SENDER
+        msg["To"] = EMAIL_RECIPIENT
+
+        html = "<h3>Daily Politician Trading Bot Report</h3>"
+
+        if buys:
+            html += "<h4>Buys Executed:</h4><ul>"
+            for sym, qty, price in buys:
+                html += f"<li>🟢 Bought {qty} {sym} @ ${price:.2f}</li>"
+            html += "</ul>"
+        else:
+            html += "<p>No buys today.</p>"
+
+        if sells:
+            html += "<h4>Sells Executed:</h4><ul>"
+            for s in sells:
+                html += f"<li>🔻 Sold {s['symbol']} — drop {s['drop_pct']*100:.2f}%</li>"
+            html += "</ul>"
+        else:
+            html += "<p>No sells today.</p>"
+
+        msg.attach(MIMEText(html, "html"))
+
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+            server.login(EMAIL_SENDER, EMAIL_PASSWORD)
+            server.sendmail(EMAIL_SENDER, EMAIL_RECIPIENT, msg.as_string())
+
+        print("Email sent")
+
+    except Exception as e:
+        print("Email error:", e)
+
+# ====================================================
+# 11. Main Run
 # ====================================================
 def run_bot():
-    print("Fetching trades...")
     df = fetch_congress_trades()
-
-    print("Scoring...")
     df_scored = score_trades(df)
 
-    print("Logging buys...")
-    log_to_sheet(df_scored)
+    log_buys_to_sheet(df_scored)
 
-    print("Buying...")
-    execute_trades(df_scored)
+    buys = execute_buys(df_scored)
+    sells = trailing_stop_and_sell()
 
-    print("Trailing stops...")
-    trailing_stop_and_sell()
+    send_email_report(buys, sells)
 
     print("Bot complete.")
 
-# ====================================================
-# Execute
-# ====================================================
+
 if __name__ == "__main__":
     run_bot()
