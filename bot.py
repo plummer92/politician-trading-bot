@@ -47,6 +47,8 @@ def fetch_congress_trades():
     r.raise_for_status()
 
     df = pd.DataFrame(r.json())
+    print("Columns returned:", df.columns.tolist())
+
 
     # Rename Quiver 'Date' → 'TransactionDate'
     df["TransactionDate"] = pd.to_datetime(df["Date"], errors="coerce")
