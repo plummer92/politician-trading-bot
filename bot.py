@@ -23,7 +23,7 @@ if not QUIVER_KEY:
     raise ValueError("QUIVER_KEY secret missing")
 
 # ====================================================
-# 2. Authenticate Google Sheets via service account file
+# 2. Authenticate Google Sheets
 # ====================================================
 creds = ServiceAccountCredentials.from_json_keyfile_name(
     GOOGLE_APPLICATION_CREDENTIALS,
@@ -47,69 +47,48 @@ def fetch_congress_trades():
     r.raise_for_status()
 
     df = pd.DataFrame(r.json())
-
     print("Columns returned:", df.columns.tolist())
 
-    # The correct date field in YOUR dataset is "Traded"
     if "Traded" not in df.columns:
         raise KeyError("Expected column 'Traded' not found in Quiver data")
 
     df["TransactionDate"] = pd.to_datetime(df["Traded"], errors="coerce")
-
-    # Drop invalid dates
     df = df.dropna(subset=["TransactionDate"])
 
-    # Filter trades from the last 30 days
     cutoff = dt.datetime.utcnow() - dt.timedelta(days=30)
     df = df[df["TransactionDate"] >= cutoff]
 
     return df
 
-
-
-
 # ====================================================
-# 4. Score trades (simple but smart model)
+# 4. Score Trades
 # ====================================================
 def score_trades(df):
     df = df.copy()
-
-    # Initialize score
     df["score"] = 0
 
-    # --- 1. Trade size score (Trade_Size_USD) ---
+    # Trade size score
     if "Trade_Size_USD" in df.columns:
         size = pd.to_numeric(df["Trade_Size_USD"], errors="coerce").fillna(0)
+        df["score"] += np.where(size >= 100000, 3,
+                        np.where(size >= 25000, 2, 1))
 
-        size_score = np.where(
-            size >= 100000, 3,
-            np.where(size >= 25000, 2, 1)
-        )
-        df["score"] += size_score
+    # Transaction type
+    df["score"] += df["Transaction"].apply(
+        lambda x: 2 if str(x).upper() == "BUY"
+        else (-2 if str(x).upper() == "SELL" else 0)
+    )
 
-    # --- 2. Transaction type (BUY / SELL) ---
-    if "Transaction" in df.columns:
-        df["score"] += df["Transaction"].apply(
-            lambda x: 2 if str(x).upper() == "BUY"
-            else (-2 if str(x).upper() == "SELL" else 0)
-        )
-
-    # --- 3. excess_return scoring ---
+    # Excess return bonus
     if "excess_return" in df.columns:
         er = pd.to_numeric(df["excess_return"], errors="coerce").fillna(0)
-        er_score = np.where(
-            er > 0.05, 2,
-            np.where(er > 0, 1, 0)
-        )
-        df["score"] += er_score
+        df["score"] += np.where(er > 0.05, 2,
+                         np.where(er > 0, 1, 0))
 
-    # --- 4. Generic activity bonus per politician ---
+    # Politician activity bonus
     df["score"] += 1
 
-    # Sort high → low
-    df = df.sort_values(by="score", ascending=False)
-
-    return df
+    return df.sort_values(by="score", ascending=False)
 
 # ====================================================
 # 5. Log trades to Google Sheets
@@ -117,82 +96,84 @@ def score_trades(df):
 def log_to_sheet(df):
     print("Logging to Google Sheets...")
 
-    # Columns to record
     cols = [
-        "TransactionDate",
-        "Ticker",
-        "Company",
-        "Transaction",
-        "Trade_Size_USD",
-        "Name",
-        "Party",
-        "District",
-        "Chamber",
-        "excess_return",
-        "score",
+        "TransactionDate","Ticker","Company","Transaction","Trade_Size_USD",
+        "Name","Party","District","Chamber","excess_return","score"
     ]
-
-    # Only keep columns that exist
     cols = [c for c in cols if c in df.columns]
 
-    # Convert to strings
     rows = df[cols].astype(str).values.tolist()
 
-    # Authorize Sheets
-    gc = gspread.authorize(ServiceAccountCredentials.from_json_keyfile_name(
-        "service_account.json",
-        ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-    ))
+    worksheet = gc.open(GOOGLE_SHEET_NAME).sheet1
 
-    sh = gc.open(GOOGLE_SHEET_NAME)
-    worksheet = sh.sheet1
-
-    # Add header if sheet is empty
+    # Write header if empty
     if worksheet.acell("A1").value in (None, ""):
         worksheet.append_row(cols)
 
-    # BATCH APPEND — CRITICAL FIX
+    # Batch append
     worksheet.append_rows(rows)
 
     print("Google Sheets logging complete.")
 
-
 # ====================================================
-# 6. Alpaca trading
+# 6. Alpaca – New Trading Engine
 # ====================================================
 trading_client = TradingClient(ALPACA_KEY, ALPACA_SECRET, paper=True)
 
-def place_trade(ticker, side, notional=50):
-    order_data = MarketOrderRequest(
-        symbol=ticker,
-        notional=notional,
-        side=OrderSide.BUY if side == "buy" else OrderSide.SELL,
-        time_in_force=TimeInForce.GTC,
-    )
-    try:
-        trading_client.submit_order(order_data=order_data)
-        print(f"Placed {side} order: {ticker}")
-    except Exception as e:
-        print(f"Order error for {ticker}: {e}")
+def execute_trades(df):
+    print("Executing Alpaca paper trades...")
 
+    df_trade = df[df["score"] >= 5]   # ⭐ NEW RULE
+
+    if df_trade.empty:
+        print("No trades above score threshold (>=5).")
+        return
+
+    # Avoid double-buying the same stock
+    existing_positions = {pos.symbol for pos in trading_client.get_all_positions()}
+
+    BUDGET = 50  # dollars per trade
+
+    for _, row in df_trade.iterrows():
+        symbol = row["Ticker"]
+
+        if not symbol or not isinstance(symbol, str):
+            continue
+
+        if symbol in existing_positions:
+            print(f"Skipping {symbol}: already owned.")
+            continue
+
+        try:
+            latest = trading_client.get_latest_trade(symbol)
+            price = latest.price
+
+            if not price or price <= 0:
+                print(f"Skipping {symbol}: invalid price")
+                continue
+
+            qty = max(1, int(BUDGET // price))
+            if qty <= 0:
+                print(f"Skipping {symbol}: insufficient funds for {symbol}")
+                continue
+
+            order_data = MarketOrderRequest(
+                symbol=symbol,
+                qty=qty,
+                side=OrderSide.BUY,
+                time_in_force=TimeInForce.DAY
+            )
+
+            trading_client.submit_order(order_data)
+            print(f"Bought {qty} shares of {symbol} (score={row['score']})")
+
+        except Exception as e:
+            print(f"Trade error for {symbol}: {e}")
+
+    print("Trade execution completed.")
 
 # ====================================================
-# 7. Strategy: Buy top 5 trades with score >= 10
-# ====================================================
-def generate_signals(df, min_score=10, limit=5):
-    signals = []
-    for _, row in df.head(limit).iterrows():
-        if row["score"] >= min_score:
-            signals.append({
-                "ticker": row["Ticker"],
-                "side": "buy",
-                "score": row["score"]
-            })
-    return signals
-
-
-# ====================================================
-# 8. Run the full bot
+# 7. Main Bot Flow
 # ====================================================
 def run_bot():
     print("Fetching trades...")
@@ -204,15 +185,10 @@ def run_bot():
     print("Logging to Google Sheets...")
     log_to_sheet(df_scored)
 
-    print("Generating signals...")
-    signals = generate_signals(df_scored)
-
-    print(f"Signals generated: {signals}")
-    for s in signals:
-        place_trade(s["ticker"], s["side"], notional=50)
+    print("Executing trades...")
+    execute_trades(df_scored)
 
     print("Bot run complete.")
-
 
 # ====================================================
 # Execute
