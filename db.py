@@ -196,3 +196,71 @@ try:
 except RuntimeError:
     # Fix for GitHub Actions where an event loop already exists
     asyncio.run(init_db())
+# ====================================================
+# 6. FETCH HELPERS FOR DASHBOARD
+# ====================================================
+
+async def fetch_raw_quiver(limit=500):
+    try:
+        async with engine.connect() as conn:
+            res = await conn.execute(text("""
+                SELECT * FROM quiver_raw
+                ORDER BY id DESC
+                LIMIT :lim
+            """), {"lim": limit})
+            rows = res.fetchall()
+            return pd.DataFrame(rows, columns=res.keys())
+    except Exception as e:
+        print("DB fetch_raw_quiver error:", e)
+        return pd.DataFrame()
+
+
+async def fetch_scored_trades(limit=500):
+    # You don't currently store scored trades — this keeps dashboard from erroring
+    return pd.DataFrame()
+
+
+async def fetch_buy_log(limit=500):
+    try:
+        async with engine.connect() as conn:
+            res = await conn.execute(text("""
+                SELECT * FROM buys
+                ORDER BY id DESC
+                LIMIT :lim
+            """), {"lim": limit})
+            rows = res.fetchall()
+            return pd.DataFrame(rows, columns=res.keys())
+    except Exception as e:
+        print("DB fetch_buy_log error:", e)
+        return pd.DataFrame()
+
+
+async def fetch_sell_log(limit=500):
+    try:
+        async with engine.connect() as conn:
+            res = await conn.execute(text("""
+                SELECT * FROM sells
+                ORDER BY id DESC
+                LIMIT :lim
+            """), {"lim": limit})
+            rows = res.fetchall()
+            return pd.DataFrame(rows, columns=res.keys())
+    except Exception as e:
+        print("DB fetch_sell_log error:", e)
+        return pd.DataFrame()
+
+
+async def fetch_run_events(limit=100):
+    try:
+        async with engine.connect() as conn:
+            res = await conn.execute(text("""
+                SELECT * FROM runs
+                ORDER BY id DESC
+                LIMIT :lim
+            """), {"lim": limit})
+            rows = res.fetchall()
+            return pd.DataFrame(rows, columns=res.keys())
+    except Exception as e:
+        print("DB fetch_run_events error:", e)
+        return pd.DataFrame()
+
