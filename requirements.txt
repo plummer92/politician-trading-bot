@@ -1,0 +1,10 @@
+alpaca-trade-api
+alpaca-py
+gspread
+oauth2client
+pandas
+numpy
+requests
+streamlit
+matplotlib
+python-dateutil
