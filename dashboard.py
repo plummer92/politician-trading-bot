@@ -1,169 +1,175 @@
 import streamlit as st
 import pandas as pd
-import datetime as dt
-import matplotlib.pyplot as plt
-import numpy as np
-from alpaca.trading.client import TradingClient
-import os
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
+from alpaca.trading.client import TradingClient
+from alpaca.data.historical import StockHistoricalDataClient
+from alpaca.data.requests import StockBarsRequest
+from alpaca.data.timeframe import TimeFrame
+import datetime
+import altair as alt
+import json
+import os
 
-# -----------------------------
-# Load Secrets
-# -----------------------------
-ALPACA_KEY = os.getenv("ALPACA_KEY")
-ALPACA_SECRET = os.getenv("ALPACA_SECRET")
-GOOGLE_SHEET_NAME = os.getenv("GOOGLE_SHEET_NAME")
-GOOGLE_APPLICATION_CREDENTIALS = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
-
-# Google Sheets setup
-creds = ServiceAccountCredentials.from_json_keyfile_name(
-    GOOGLE_APPLICATION_CREDENTIALS,
-    ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-)
-gc = gspread.authorize(creds)
-
-# Alpaca client
-trading_client = TradingClient(ALPACA_KEY, ALPACA_SECRET, paper=True)
-
-# ===============================================
-# Helper: Load Buy Log
-# ===============================================
-def load_buys():
-    sh = gc.open(GOOGLE_SHEET_NAME)
-    ws = sh.sheet1
-    data = ws.get_all_records()
-    if not data:
-        return pd.DataFrame()
-    return pd.DataFrame(data)
-
-# ===============================================
-# Helper: Load Sales Log
-# ===============================================
-def load_sales():
-    try:
-        sh = gc.open(GOOGLE_SHEET_NAME)
-        ws = sh.worksheet("Sales_Log")
-        data = ws.get_all_records()
-        return pd.DataFrame(data)
-    except:
-        return pd.DataFrame()
-
-# ===============================================
-# Helper: Fetch portfolio from Alpaca
-# ===============================================
-def load_portfolio():
-    positions = trading_client.get_all_positions()
-    rows = []
-    for p in positions:
-        rows.append({
-            "symbol": p.symbol,
-            "qty": float(p.qty),
-            "avg_entry": float(p.avg_entry_price),
-            "current": float(p.current_price),
-        })
-    return pd.DataFrame(rows)
-
-# ===============================================
-# Dashboard UI
-# ===============================================
 st.set_page_config(page_title="Politician Trading Dashboard", layout="wide")
-st.title("📊 Politician Trading Bot — Portfolio Dashboard")
 
-# Load Data
-buys = load_buys()
-sales = load_sales()
-portfolio = load_portfolio()
+# ============================================================
+# LOAD SECRETS
+# ============================================================
+QUIVER_KEY = st.secrets["QUIVER_KEY"]
+ALPACA_KEY = st.secrets["ALPACA_KEY"]
+ALPACA_SECRET = st.secrets["ALPACA_SECRET"]
+GOOGLE_SHEET_NAME = st.secrets["GOOGLE_SHEET_NAME"]
+GCP_JSON = json.loads(st.secrets["GOOGLE_APPLICATION_CREDENTIALS"])
 
-# -----------------------------
-# PORTFOLIO SUMMARY
-# -----------------------------
-st.header("💼 Portfolio Summary")
+# ============================================================
+# GOOGLE SHEETS CONNECTION
+# ============================================================
+def connect_sheets():
+    scope = [
+        "https://spreadsheets.google.com/feeds",
+        "https://www.googleapis.com/auth/drive",
+    ]
+    creds = ServiceAccountCredentials.from_json_keyfile_dict(GCP_JSON, scope)
+    client = gspread.authorize(creds)
+    return client.open(GOOGLE_SHEET_NAME)
 
-if portfolio.empty:
+try:
+    sh = connect_sheets()
+    trades_ws = sh.worksheet("Trades")
+    buys_ws = sh.worksheet("Buys")
+except Exception as e:
+    st.error(f"Failed to connect to Google Sheets: {e}")
+    st.stop()
+
+# Load data
+trades_df = pd.DataFrame(trades_ws.get_all_records())
+buys_df = pd.DataFrame(buys_ws.get_all_records())
+
+# ============================================================
+# ALPACA CLIENTS
+# ============================================================
+trading_client = TradingClient(ALPACA_KEY, ALPACA_SECRET, paper=True)
+market_client = StockHistoricalDataClient(ALPACA_KEY, ALPACA_SECRET)
+
+# ============================================================
+# SIDEBAR
+# ============================================================
+st.sidebar.header("📊 Dashboard Filters")
+show_equity = st.sidebar.checkbox("Show Equity Curve", True)
+show_positions = st.sidebar.checkbox("Show Current Positions", True)
+show_heatmap = st.sidebar.checkbox("Show Score Heatmap", True)
+show_politicians = st.sidebar.checkbox("Show Politician Activity", True)
+
+# ============================================================
+# TITLE
+# ============================================================
+st.title("🇺🇸 Politician Trading Bot — Portfolio Dashboard")
+
+st.markdown("This dashboard visualizes your automated trading bot activity, performance, and portfolio health.")
+
+# ============================================================
+# CURRENT PORTFOLIO
+# ============================================================
+st.header("📈 Current Portfolio")
+
+try:
+    positions = trading_client.get_all_positions()
+except Exception as e:
+    st.error(f"Error fetching positions: {e}")
+    positions = []
+
+if positions:
+    pos_data = []
+    total_value = 0
+
+    for p in positions:
+        current_val = float(p.market_value)
+        total_value += current_val
+        pos_data.append({
+            "Symbol": p.symbol,
+            "Qty": p.qty,
+            "Cost Basis": float(p.cost_basis),
+            "Current Price": float(p.current_price),
+            "Market Value": current_val,
+            "Unrealized P/L": float(p.unrealized_pl)
+        })
+
+    pos_df = pd.DataFrame(pos_data)
+    st.dataframe(pos_df, use_container_width=True)
+
+    st.metric("Total Portfolio Value", f"${total_value:,.2f}")
+
+else:
     st.info("No open positions.")
-else:
-    portfolio["unrealized_pl"] = (portfolio["current"] - portfolio["avg_entry"]) * portfolio["qty"]
-    portfolio["pl_pct"] = (portfolio["current"] - portfolio["avg_entry"]) / portfolio["avg_entry"]
 
-    total_value = (portfolio["current"] * portfolio["qty"]).sum()
-    total_profit = portfolio["unrealized_pl"].sum()
+# ============================================================
+# EQUITY CURVE
+# ============================================================
+if show_equity:
+    st.header("📉 Equity Curve")
 
-    col1, col2 = st.columns(2)
-    col1.metric("Total Portfolio Value", f"${total_value:,.2f}")
-    col2.metric("Unrealized P/L", f"${total_profit:,.2f}")
+    if not trades_df.empty:
+        trades_df["Timestamp"] = pd.to_datetime(trades_df["Timestamp"])
+        trades_df["PortfolioValue"] = trades_df["PortfolioValue"].astype(float)
 
-    st.dataframe(portfolio)
+        chart = (
+            alt.Chart(trades_df)
+            .mark_line()
+            .encode(
+                x="Timestamp:T",
+                y="PortfolioValue:Q"
+            )
+            .properties(height=300)
+        )
 
-# -----------------------------
-# PIE CHART: POSITION DISTRIBUTION
-# -----------------------------
-if not portfolio.empty:
-    st.subheader("📌 Position Distribution")
+        st.altair_chart(chart, use_container_width=True)
+    else:
+        st.info("No trade history yet.")
 
-    fig, ax = plt.subplots()
-    ax.pie(
-        portfolio["qty"],
-        labels=portfolio["symbol"],
-        autopct="%1.1f%%"
-    )
-    st.pyplot(fig)
-
-# -----------------------------
-# EQUITY CURVE (Based on log)
-# -----------------------------
-st.header("📈 Equity Curve")
-
-if buys.empty:
-    st.info("No buy history yet.")
-else:
-    buys["TransactionDate"] = pd.to_datetime(buys["TransactionDate"], errors="coerce")
-    buys["Trade_Size_USD"] = pd.to_numeric(buys["Trade_Size_USD"], errors="coerce").fillna(0)
-
-    eq = buys.sort_values("TransactionDate").copy()
-    eq["cumulative_spend"] = eq["Trade_Size_USD"].cumsum()
-
-    fig, ax = plt.subplots()
-    ax.plot(eq["TransactionDate"], eq["cumulative_spend"], label="Cumulative Buy Volume")
-    ax.set_xlabel("Date")
-    ax.set_ylabel("Total Invested ($)")
-    ax.legend()
-    st.pyplot(fig)
-
-# -----------------------------
+# ============================================================
 # SCORE HEATMAP
-# -----------------------------
-st.header("🔥 Score Heatmap")
+# ============================================================
+if show_heatmap:
+    st.header("🔥 Buy Score Heatmap")
 
-if not buys.empty:
-    st.write("Higher score = stronger politician conviction")
+    if not buys_df.empty:
+        buys_df["Score"] = buys_df["Score"].astype(float)
 
-    score_df = buys[["Ticker", "score"]]
+        heat = (
+            alt.Chart(buys_df)
+            .mark_rect()
+            .encode(
+                x="Symbol:N",
+                y="Score:Q",
+                color="Score:Q"
+            )
+        )
 
-    # Pivot into heatmap format
-    heatmap = score_df.pivot_table(
-        index="Ticker", values="score", aggfunc="mean"
-    )
+        st.altair_chart(heat, use_container_width=True)
+    else:
+        st.info("No scored buys yet.")
 
-    st.dataframe(heatmap.style.background_gradient(cmap="RdYlGn"))
-
-# -----------------------------
+# ============================================================
 # POLITICIAN ACTIVITY
-# -----------------------------
-st.header("🏛 Most Active Politician Trades")
+# ============================================================
+if show_politicians:
+    st.header("🏛 Politician Trading Volume")
 
-if not buys.empty:
-    activity = buys["Ticker"].value_counts().head(10)
-    st.bar_chart(activity)
+    if not buys_df.empty:
+        counts = buys_df["Politician"].value_counts().reset_index()
+        counts.columns = ["Politician", "Trades"]
 
-# -----------------------------
-# SALES HISTORY
-# -----------------------------
-st.header("📉 Closed Trades (Sales Log)")
+        bar = (
+            alt.Chart(counts)
+            .mark_bar()
+            .encode(
+                x="Politician:N",
+                y="Trades:Q",
+                color="Trades:Q"
+            )
+        )
 
-if sales.empty:
-    st.info("No trailing-stop sales yet.")
-else:
-    st.dataframe(sales)
-
-st.success("Dashboard loaded successfully!")
+        st.altair_chart(bar, use_container_width=True)
+    else:
+        st.info("No political activity logged yet.")
