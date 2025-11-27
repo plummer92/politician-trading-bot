@@ -3,7 +3,7 @@ name: Run Politician Trading Bot
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 14 * * *"   # runs daily at 8 AM CST (14 UTC)
+    - cron: "0 14 * * *"   # runs daily at 8 AM CST
 
 jobs:
   run-bot:
@@ -25,7 +25,7 @@ jobs:
 
     - name: Write Google credentials JSON
       run: |
-        echo '${{ toJSON(secrets.google_credentials) }}' > credentials.json
+        printf "%s" "${{ secrets.GOOGLE_SERVICE_JSON }}" > credentials.json
 
     - name: Run bot
       env:
