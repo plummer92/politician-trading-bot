@@ -16,7 +16,6 @@ if not DB_URL:
 if DB_URL.startswith("postgresql://"):
     DB_URL = DB_URL.replace("postgresql://", "postgresql+asyncpg://")
 
-# Create async engine
 engine = create_async_engine(
     DB_URL,
     echo=False,
@@ -25,18 +24,20 @@ engine = create_async_engine(
 )
 
 # ====================================================
-# 2. Helpers
+# Helpers
 # ====================================================
 
 def clean_json(value):
-    """Convert Pandas + NumPy + Timestamps into JSON-safe types"""
-    if isinstance(value, (datetime,)):
+    """Convert Pandas + NumPy + timestamps into JSON-safe types."""
+    if isinstance(value, datetime):
         return value.isoformat()
 
     try:
         import pandas as pd
         import numpy as np
-        if isinstance(value, (pd.Timestamp, np.datetime64)):
+        if isinstance(value, pd.Timestamp):
+            return str(value)
+        if isinstance(value, np.datetime64):
             return str(value)
         if isinstance(value, (np.int64, np.float64)):
             return float(value)
@@ -47,53 +48,60 @@ def clean_json(value):
 
 
 def row_to_json(row_dict):
-    """Convert entire dict to JSON-safe"""
     return {k: clean_json(v) for k, v in row_dict.items()}
 
+
 # ====================================================
-# 3. Startup: create tables
+# 2. Table definitions (each executed separately)
 # ====================================================
 
-CREATE_TABLES = """
-CREATE TABLE IF NOT EXISTS runs (
-    id SERIAL PRIMARY KEY,
-    ts TIMESTAMP DEFAULT NOW(),
-    event TEXT
-);
-
-CREATE TABLE IF NOT EXISTS quiver_raw (
-    id SERIAL PRIMARY KEY,
-    ts TIMESTAMP DEFAULT NOW(),
-    ticker TEXT,
-    transaction TEXT,
-    traded TIMESTAMP,
-    raw_json JSONB
-);
-
-CREATE TABLE IF NOT EXISTS buys (
-    id SERIAL PRIMARY KEY,
-    ts TIMESTAMP DEFAULT NOW(),
-    symbol TEXT,
-    qty INT,
-    price NUMERIC
-);
-
-CREATE TABLE IF NOT EXISTS sells (
-    id SERIAL PRIMARY KEY,
-    ts TIMESTAMP DEFAULT NOW(),
-    symbol TEXT,
-    qty INT,
-    price NUMERIC,
-    reason TEXT
-);
-"""
+TABLES = [
+    """
+    CREATE TABLE IF NOT EXISTS runs (
+        id SERIAL PRIMARY KEY,
+        ts TIMESTAMP DEFAULT NOW(),
+        event TEXT
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS quiver_raw (
+        id SERIAL PRIMARY KEY,
+        ts TIMESTAMP DEFAULT NOW(),
+        ticker TEXT,
+        transaction TEXT,
+        traded TIMESTAMP,
+        raw_json JSONB
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS buys (
+        id SERIAL PRIMARY KEY,
+        ts TIMESTAMP DEFAULT NOW(),
+        symbol TEXT,
+        qty INT,
+        price NUMERIC
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS sells (
+        id SERIAL PRIMARY KEY,
+        ts TIMESTAMP DEFAULT NOW(),
+        symbol TEXT,
+        qty INT,
+        price NUMERIC,
+        reason TEXT
+    )
+    """
+]
 
 async def init_db():
     async with engine.begin() as conn:
-        await conn.execute(text(CREATE_TABLES))
+        for sql in TABLES:
+            await conn.execute(text(sql))
+
 
 # ====================================================
-# 4. Insert Functions
+# 3. Insert functions
 # ====================================================
 
 async def log_run(event: str):
@@ -101,19 +109,18 @@ async def log_run(event: str):
         async with engine.begin() as conn:
             await conn.execute(
                 text("INSERT INTO runs (event) VALUES (:event)"),
-                {"event": event}
+                {"event": event},
             )
     except Exception as e:
         print("DB log_run error:", e)
 
 
 async def log_quiver_raw(df):
-    """Insert all politician trades"""
+    """Insert all Quiver Congress trades"""
     try:
         async with engine.begin() as conn:
             for _, row in df.iterrows():
                 data = row_to_json(row.to_dict())
-
                 await conn.execute(
                     text("""
                         INSERT INTO quiver_raw (ticker, transaction, traded, raw_json)
@@ -124,7 +131,7 @@ async def log_quiver_raw(df):
                         "transaction": data.get("Transaction"),
                         "traded": data.get("TransactionDate"),
                         "raw_json": json.dumps(data)
-                    }
+                    },
                 )
     except Exception as e:
         print("DB log_quiver_raw error:", e)
@@ -138,7 +145,7 @@ async def log_buy(symbol, qty, price):
                     INSERT INTO buys (symbol, qty, price)
                     VALUES (:symbol, :qty, :price)
                 """),
-                {"symbol": symbol, "qty": qty, "price": price}
+                {"symbol": symbol, "qty": qty, "price": price},
             )
     except Exception as e:
         print("DB log_buy error:", e)
@@ -152,29 +159,31 @@ async def log_sell(symbol, qty, price, reason):
                     INSERT INTO sells (symbol, qty, price, reason)
                     VALUES (:symbol, :qty, :price, :reason)
                 """),
-                {"symbol": symbol, "qty": qty, "price": price, "reason": reason}
+                {"symbol": symbol, "qty": qty, "price": price, "reason": reason},
             )
     except Exception as e:
         print("DB log_sell error:", e)
 
+
 # ====================================================
-# 5. Optional: Fetch Functions
+# 4. Fetch functions
 # ====================================================
 
 async def fetch_last_runs(limit=20):
     try:
         async with engine.connect() as conn:
-            result = await conn.execute(
+            rows = await conn.execute(
                 text("SELECT * FROM runs ORDER BY id DESC LIMIT :lim"),
-                {"lim": limit}
+                {"lim": limit},
             )
-            return result.fetchall()
+            return rows.fetchall()
     except Exception as e:
         print("DB fetch_last_runs error:", e)
         return []
 
+
 # ====================================================
-# 6. Module initialization
+# 5. Initialize DB on import
 # ====================================================
 
 asyncio.get_event_loop().run_until_complete(init_db())
