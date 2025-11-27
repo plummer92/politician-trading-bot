@@ -12,7 +12,7 @@ DB_URL = os.getenv("DATABASE_URL")
 if not DB_URL:
     raise RuntimeError("DATABASE_URL missing from environment!")
 
-# Force asyncpg dialect
+# Convert to asyncpg dialect
 if DB_URL.startswith("postgresql://"):
     DB_URL = DB_URL.replace("postgresql://", "postgresql+asyncpg://")
 
@@ -24,11 +24,11 @@ engine = create_async_engine(
 )
 
 # ====================================================
-# Helpers
+# Helpers for JSON-safe cleaning
 # ====================================================
 
 def clean_json(value):
-    """Convert Pandas + NumPy + timestamps into JSON-safe types."""
+    """Convert Pandas/NumPy/timestamps into JSON-safe types."""
     if isinstance(value, datetime):
         return value.isoformat()
 
@@ -52,7 +52,7 @@ def row_to_json(row_dict):
 
 
 # ====================================================
-# 2. Table definitions (each executed separately)
+# 2. Table definitions — executed separately
 # ====================================================
 
 TABLES = [
@@ -94,7 +94,9 @@ TABLES = [
     """
 ]
 
+
 async def init_db():
+    """Initialize the database (tables)."""
     async with engine.begin() as conn:
         for sql in TABLES:
             await conn.execute(text(sql))
@@ -104,7 +106,8 @@ async def init_db():
 # 3. Insert functions
 # ====================================================
 
-async def log_run(event: str):
+async def log_run_event(event: str):
+    """Record a run start/end/error."""
     try:
         async with engine.begin() as conn:
             await conn.execute(
@@ -112,11 +115,11 @@ async def log_run(event: str):
                 {"event": event},
             )
     except Exception as e:
-        print("DB log_run error:", e)
+        print("DB log_run_event error:", e)
 
 
 async def log_quiver_raw(df):
-    """Insert all Quiver Congress trades"""
+    """Insert Quiver raw rows."""
     try:
         async with engine.begin() as conn:
             for _, row in df.iterrows():
@@ -138,6 +141,7 @@ async def log_quiver_raw(df):
 
 
 async def log_buy(symbol, qty, price):
+    """Record a buy execution."""
     try:
         async with engine.begin() as conn:
             await conn.execute(
@@ -152,6 +156,7 @@ async def log_buy(symbol, qty, price):
 
 
 async def log_sell(symbol, qty, price, reason):
+    """Record a sell execution."""
     try:
         async with engine.begin() as conn:
             await conn.execute(
@@ -172,18 +177,22 @@ async def log_sell(symbol, qty, price, reason):
 async def fetch_last_runs(limit=20):
     try:
         async with engine.connect() as conn:
-            rows = await conn.execute(
+            res = await conn.execute(
                 text("SELECT * FROM runs ORDER BY id DESC LIMIT :lim"),
                 {"lim": limit},
             )
-            return rows.fetchall()
+            return res.fetchall()
     except Exception as e:
         print("DB fetch_last_runs error:", e)
         return []
 
 
 # ====================================================
-# 5. Initialize DB on import
+# 5. Auto-initialize the DB on import
 # ====================================================
 
-asyncio.get_event_loop().run_until_complete(init_db())
+try:
+    asyncio.get_event_loop().run_until_complete(init_db())
+except RuntimeError:
+    # Fix for GitHub Actions where an event loop already exists
+    asyncio.run(init_db())
