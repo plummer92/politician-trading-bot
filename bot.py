@@ -47,7 +47,9 @@ def fetch_congress_trades():
     r.raise_for_status()
 
     df = pd.DataFrame(r.json())
-    df["TransactionDate"] = pd.to_datetime(df["TransactionDate"], errors="coerce")
+
+    # Rename Quiver 'Date' → 'TransactionDate'
+    df["TransactionDate"] = pd.to_datetime(df["Date"], errors="coerce")
     df = df.dropna(subset=["TransactionDate"])
 
     # Only keep last 30 days
@@ -55,6 +57,7 @@ def fetch_congress_trades():
     df = df[df["TransactionDate"] >= cutoff]
 
     return df
+
 
 
 # ====================================================
