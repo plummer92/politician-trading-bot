@@ -155,8 +155,11 @@ with tab5:
     st.dataframe(run_events, use_container_width=True)
 
     if not run_events.empty:
-        fig = px.line(run_events, x="ts", y="event_type",
-                      title="Bot Run Event Timeline")
+        fig = px.scatter(run_events, x="ts", y="event",
+                 title="Bot Run Event Timeline",
+                 color="event",
+                 hover_data=["id"])
+
         st.plotly_chart(fig, use_container_width=True)
 
 
