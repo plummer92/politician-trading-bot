@@ -77,33 +77,39 @@ def score_trades(df):
     # Initialize score
     df["score"] = 0
 
-    # 1. Trade size score (Trade_Size_USD)
+    # --- 1. Trade size score (Trade_Size_USD) ---
     if "Trade_Size_USD" in df.columns:
-        df["score"] += df["Trade_Size_USD"].apply(
-            lambda x: 3 if x >= 100000 else (2 if x >= 25000 else 1)
-        )
+        size = pd.to_numeric(df["Trade_Size_USD"], errors="coerce").fillna(0)
 
-    # 2. Transaction type (BUY / SELL)
+        size_score = np.where(
+            size >= 100000, 3,
+            np.where(size >= 25000, 2, 1)
+        )
+        df["score"] += size_score
+
+    # --- 2. Transaction type (BUY / SELL) ---
     if "Transaction" in df.columns:
         df["score"] += df["Transaction"].apply(
-            lambda x: 2 if str(x).upper() == "BUY" else (-2 if str(x).upper() == "SELL" else 0)
+            lambda x: 2 if str(x).upper() == "BUY"
+            else (-2 if str(x).upper() == "SELL" else 0)
         )
 
-    # 3. excess_return scoring
+    # --- 3. excess_return scoring ---
     if "excess_return" in df.columns:
-        df["score"] += df["excess_return"].apply(
-            lambda x: 2 if x > 0.05 else (1 if x > 0 else 0)
+        er = pd.to_numeric(df["excess_return"], errors="coerce").fillna(0)
+        er_score = np.where(
+            er > 0.05, 2,
+            np.where(er > 0, 1, 0)
         )
+        df["score"] += er_score
 
-    # 4. Generic activity bonus per politician
+    # --- 4. Generic activity bonus per politician ---
     df["score"] += 1
 
     # Sort high → low
     df = df.sort_values(by="score", ascending=False)
 
     return df
-
-
 
 # ====================================================
 # 5. Log trades to Google Sheets
