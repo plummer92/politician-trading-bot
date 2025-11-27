@@ -23,7 +23,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install requests pandas numpy gspread oauth2client alpaca-trade-api
+          pip install requests pandas numpy gspread oauth2client alpaca-py
 
       - name: Create Google Service JSON
         env:
