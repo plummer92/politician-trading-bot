@@ -73,24 +73,36 @@ def fetch_congress_trades():
 # ====================================================
 def score_trades(df):
     df = df.copy()
+
+    # Initialize score
     df["score"] = 0
 
-    # Buy > Sell
-    df["score"] += df["Transaction"].apply(lambda x: 5 if "Purchase" in x else -3)
+    # 1. Trade size score (Trade_Size_USD)
+    if "Trade_Size_USD" in df.columns:
+        df["score"] += df["Trade_Size_USD"].apply(
+            lambda x: 3 if x >= 100000 else (2 if x >= 25000 else 1)
+        )
 
-    # Amount size
-    df["score"] += df["Range"].apply(lambda x: 3 if "$50,000" in x else 1)
+    # 2. Transaction type (BUY / SELL)
+    if "Transaction" in df.columns:
+        df["score"] += df["Transaction"].apply(
+            lambda x: 2 if str(x).upper() == "BUY" else (-2 if str(x).upper() == "SELL" else 0)
+        )
 
-    # Politician impact
-    high_profile = ["Pelosi", "Schumer", "McConnell", "Hawley", "AOC"]
-    df["score"] += df["Representative"].apply(lambda x: 4 if any(h in x for h in high_profile) else 0)
+    # 3. excess_return scoring
+    if "excess_return" in df.columns:
+        df["score"] += df["excess_return"].apply(
+            lambda x: 2 if x > 0.05 else (1 if x > 0 else 0)
+        )
 
-    # Recency bonus
-    now = dt.datetime.now()
-    df["score"] += df["TransactionDate"].apply(lambda x: max(0, 10 - (now - x).days))
+    # 4. Generic activity bonus per politician
+    df["score"] += 1
 
-    df = df.sort_values("score", ascending=False)
+    # Sort high → low
+    df = df.sort_values(by="score", ascending=False)
+
     return df
+
 
 
 # ====================================================
