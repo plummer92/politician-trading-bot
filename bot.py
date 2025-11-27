@@ -30,25 +30,28 @@ EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")
 EMAIL_RECIPIENT = os.getenv("EMAIL_RECIPIENT")
 
 # ====================================================
-# 2. Import Neon async logging
+# 2. Neon Async Logging
 # ====================================================
-import db  # <-- this connects to Neon
+import db  # uses async Neon engine
+
 
 # ====================================================
-# 3. Google Sheets Authentication
+# 3. Google Sheets
 # ====================================================
 creds = ServiceAccountCredentials.from_json_keyfile_name(
     GOOGLE_APPLICATION_CREDENTIALS,
-    ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+    ["https://spreadsheets.google.com/feeds",
+     "https://www.googleapis.com/auth/drive"]
 )
 gc = gspread.authorize(creds)
 
+
 # ====================================================
-# 4. Trailing Stop Setup
+# 4. Trailing Stop System
 # ====================================================
 TRAILING_FILE = "trailing_sl.json"
-TRAIL_PERCENT = 0.08          # 8% trailing stop
-TOP_LOSERS_TO_SELL = 3        # sell 3 worst losers per run
+TRAIL_PERCENT = 0.08          # 8% trailing stop loss
+TOP_LOSERS_TO_SELL = 3        # max sells/day
 
 
 def load_trailing_data():
@@ -65,8 +68,9 @@ def save_trailing_data(data):
     with open(TRAILING_FILE, "w") as f:
         json.dump(data, f, indent=4)
 
+
 # ====================================================
-# 5. Fetch Quiver Congress Trading
+# 5. Fetch Quiver Congress Trades
 # ====================================================
 def fetch_congress_trades():
     url = "https://api.quiverquant.com/beta/bulk/congresstrading"
@@ -77,19 +81,15 @@ def fetch_congress_trades():
 
     df = pd.DataFrame(r.json())
 
-    if "Traded" not in df.columns:
-        raise RuntimeError("Quiver data missing 'Traded' column")
-
     df["TransactionDate"] = pd.to_datetime(df["Traded"], errors="coerce")
     df = df.dropna(subset=["TransactionDate"])
 
     cutoff = dt.datetime.utcnow() - dt.timedelta(days=30)
-    df = df[df["TransactionDate"] >= cutoff]
+    return df[df["TransactionDate"] >= cutoff]
 
-    return df
 
 # ====================================================
-# 6. Score Trades
+# 6. Trade Scoring Engine
 # ====================================================
 def score_trades(df):
     df = df.copy()
@@ -97,17 +97,17 @@ def score_trades(df):
 
     # Trade size
     if "Trade_Size_USD" in df.columns:
-        size = pd.to_numeric(df["Trade_Size_USD"], errors="coerce").fillna(0)
+        size = pd.to_numeric(df["Trade_Size_USD"], errors="ignore")
         df["score"] += np.where(size >= 100000, 3,
                         np.where(size >= 25000, 2, 1))
 
     # Buy > Sell
     df["score"] += df["Transaction"].apply(
-        lambda t: 2 if str(t).upper() == "BUY"
-        else (-2 if str(t).upper() == "SELL" else 0)
+        lambda t: 2 if str(t).upper().startswith("BUY") else
+                  (-2 if str(t).upper().startswith("SELL") else 0)
     )
 
-    # Excess return
+    # Excess return bonus
     if "excess_return" in df.columns:
         er = pd.to_numeric(df["excess_return"], errors="coerce").fillna(0)
         df["score"] += np.where(er > 0.05, 2,
@@ -116,10 +116,11 @@ def score_trades(df):
     # Politician bonus
     df["score"] += 1
 
-    return df.sort_values(by="score", ascending=False)
+    return df.sort_values("score", ascending=False)
+
 
 # ====================================================
-# 7. Log Buys to Google Sheets
+# 7. Log Buys to Google Sheet
 # ====================================================
 def log_buys_to_sheet(df):
     try:
@@ -141,6 +142,7 @@ def log_buys_to_sheet(df):
     ws.append_rows(df[cols].astype(str).values.tolist())
     print("Logged buys to sheet")
 
+
 # ====================================================
 # 8. Alpaca Buy Engine
 # ====================================================
@@ -156,15 +158,12 @@ def get_price(symbol):
 
 
 def execute_buys(df):
-    df_trade = df[df["score"] >= 6]  # BUY THRESHOLD = 6
-
+    df_trade = df[df["score"] >= 6]
     if df_trade.empty:
-        print("No trades >= 6")
         return []
 
     existing = {p.symbol for p in trading_client.get_all_positions()}
     bought = []
-
     BUDGET = 50
 
     for _, row in df_trade.iterrows():
@@ -174,7 +173,7 @@ def execute_buys(df):
             continue
 
         price = get_price(sym)
-        if not price or price <= 0:
+        if not price:
             continue
 
         qty = max(1, int(BUDGET // price))
@@ -188,23 +187,21 @@ def execute_buys(df):
                     time_in_force=TimeInForce.DAY
                 )
             )
-            print(f"Bought {qty} {sym}")
             bought.append((sym, qty, price))
-
         except Exception as e:
-            print(f"Buy error for {sym}:", e)
+            print(f"Buy error {sym}:", e)
 
     return bought
 
+
 # ====================================================
-# 9. Trailing Stop Engine
+# 9. Trailing Stop Sell Engine
 # ====================================================
 def trailing_stop_and_sell():
     trailing = load_trailing_data()
     positions = trading_client.get_all_positions()
 
     if not positions:
-        print("No positions to evaluate")
         return []
 
     evaluations = []
@@ -221,7 +218,7 @@ def trailing_stop_and_sell():
 
         trailing[sym] = {"highest": highest}
 
-        drop_pct = (highest - current) / highest
+        drop_pct = (highest - current) / highest if highest > 0 else 0
         pl_pct = (current - cost) / cost if cost > 0 else 0
 
         evaluations.append({
@@ -240,7 +237,6 @@ def trailing_stop_and_sell():
     violators.sort(key=lambda x: x["pl_pct"])
 
     sells = violators[:TOP_LOSERS_TO_SELL]
-
     executed = []
 
     for row in sells:
@@ -253,16 +249,15 @@ def trailing_stop_and_sell():
                     time_in_force=TimeInForce.DAY
                 )
             )
-            print(f"Sold {row['symbol']} — drop {row['drop_pct']*100:.2f}%")
             executed.append(row)
-
         except Exception as e:
-            print(f"Sell error for {row['symbol']}:", e)
+            print(f"Sell error {row['symbol']}:", e)
 
     return executed
 
+
 # ====================================================
-# 🔔 Email Report
+# 🔔 10. Email Report
 # ====================================================
 def send_email_report(buys, sells):
     try:
@@ -274,17 +269,17 @@ def send_email_report(buys, sells):
         html = "<h3>Daily Politician Trading Bot Report</h3>"
 
         if buys:
-            html += "<h4>Buys Executed:</h4><ul>"
+            html += "<h4>Buys:</h4><ul>"
             for sym, qty, price in buys:
-                html += f"<li>🟢 Bought {qty} {sym} @ ${price:.2f}</li>"
+                html += f"<li>Bought {qty} {sym} @ ${price:.2f}</li>"
             html += "</ul>"
         else:
             html += "<p>No buys today.</p>"
 
         if sells:
-            html += "<h4>Sells Executed:</h4><ul>"
+            html += "<h4>Sells:</h4><ul>"
             for s in sells:
-                html += f"<li>🔻 Sold {s['symbol']} — drop {s['drop_pct']*100:.2f}%</li>"
+                html += f"<li>Sold {s['symbol']} — drop {s['drop_pct']*100:.2f}%</li>"
             html += "</ul>"
         else:
             html += "<p>No sells today.</p>"
@@ -300,6 +295,7 @@ def send_email_report(buys, sells):
     except Exception as e:
         print("Email error:", e)
 
+
 # ====================================================
 # 11. Main Run
 # ====================================================
@@ -307,26 +303,21 @@ def run_bot():
     df = fetch_congress_trades()
     df_scored = score_trades(df)
 
-    # GOOGLE SHEETS (keep existing)
     log_buys_to_sheet(df_scored)
 
-    # EXECUTE TRADES
     buys = execute_buys(df_scored)
     sells = trailing_stop_and_sell()
 
-    # EMAIL REPORT
     send_email_report(buys, sells)
 
-    # =======================================
-    # 🔥 Fire-and-forget Neon logging
-    # =======================================
+    # Async Neon Logging
     async def async_logging():
-        await db.log_run_event("start")
+        await db.log_run("start")
         await db.log_quiver_raw(df)
-        await db.log_scored_trades(df_scored)
-        await db.log_buys(buys)
-        await db.log_sells(sells)
-        await db.log_run_event("end")
+        await db.log_scored(df_scored)
+        await db.log_buy(buys)
+        await db.log_sell(sells)
+        await db.log_run("end")
 
     asyncio.run(async_logging())
 
