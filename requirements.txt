@@ -1,10 +1,12 @@
-alpaca-trade-api
 alpaca-py
 gspread
 oauth2client
 pandas
 numpy
 requests
-streamlit
 matplotlib
 python-dateutil
+sqlalchemy==2.0.23
+asyncpg==0.29.0
+python-dotenv
+
