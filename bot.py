@@ -117,7 +117,7 @@ def score_trades(df):
 def log_to_sheet(df):
     print("Logging to Google Sheets...")
 
-    # Columns we want to record
+    # Columns to record
     cols = [
         "TransactionDate",
         "Ticker",
@@ -132,13 +132,13 @@ def log_to_sheet(df):
         "score",
     ]
 
-    # Filter to existing columns only (avoids KeyErrors)
+    # Only keep columns that exist
     cols = [c for c in cols if c in df.columns]
 
-    # Convert everything to string for Sheets
+    # Convert to strings
     rows = df[cols].astype(str).values.tolist()
 
-    # Connect to Google Sheet
+    # Authorize Sheets
     gc = gspread.authorize(ServiceAccountCredentials.from_json_keyfile_name(
         "service_account.json",
         ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
@@ -148,12 +148,11 @@ def log_to_sheet(df):
     worksheet = sh.sheet1
 
     # Add header if sheet is empty
-    if worksheet.row_count == 0 or worksheet.cell(1,1).value == "":
+    if worksheet.acell("A1").value in (None, ""):
         worksheet.append_row(cols)
 
-    # Append all new rows
-    for row in rows:
-        worksheet.append_row(row)
+    # BATCH APPEND — CRITICAL FIX
+    worksheet.append_rows(rows)
 
     print("Google Sheets logging complete.")
 
